@@ -1,111 +1,36 @@
-"""
-Find path tool - finds files by name or pattern.
-
-Ported from Zed's FindPathTool. Uses fuzzy and glob matching
-to locate files in the project.
-"""
-
+"""Mirrors crates/agent/src/tools/find_path_tool.rs."""
 from __future__ import annotations
-
-import fnmatch
-import os
+import fnmatch, os
 from typing import Any
-
-from zed_agent.core.types import ToolKind
-from zed_agent.tools.base import AgentTool
-
-MAX_RESULTS = 20
-
+from zed_agent.thread import AgentTool, ToolCallEventStream, ToolKind
 
 class FindPathTool(AgentTool):
-    """Find files and directories by name or glob pattern."""
-
-    def __init__(self, working_directory: str):
-        self._working_dir = working_directory
-
-    @property
-    def name(self) -> str:
-        return "find_path"
-
-    @property
+    NAME = "find_path"
+    def __init__(self, wd: str):
+        self._wd = wd
     def description(self) -> str:
-        return (
-            "Searches for files and directories by name or glob pattern.\n\n"
-            "- Use this to find the full path of a file when you only know "
-            "the filename or a partial path.\n"
-            "- Returns matching paths relative to the project root.\n"
-            "- Use glob patterns like '*.rs' or '**/test_*.py'."
-        )
-
-    @property
+        return "Searches for files and directories by name or glob pattern."
     def kind(self) -> ToolKind:
-        return ToolKind.SEARCH
-
-    @property
+        return ToolKind.Search
     def input_schema(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": (
-                        "A filename, partial path, or glob pattern to search for. "
-                        "Examples: 'main.py', '*.rs', '**/test_*.py'"
-                    ),
-                },
-            },
-            "required": ["pattern"],
-        }
-
+        return {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}
     def initial_title(self, input: dict[str, Any]) -> str:
-        pattern = input.get("pattern", "")
-        return f"Find path `{pattern}`"
+        return f"Find path `{input.get('pattern','')}`"
 
-    async def run(self, input: dict[str, Any]) -> str:
-        pattern = input.get("pattern", "")
-        matches: list[str] = []
-
-        for dirpath, dirnames, filenames in os.walk(self._working_dir):
-            # Skip hidden and common non-code dirs
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not d.startswith(".")
-                and d not in ("node_modules", "__pycache__", "target", ".git")
-            ]
-
-            for name in filenames + dirnames:
-                filepath = os.path.join(dirpath, name)
-                rel_path = os.path.relpath(filepath, self._working_dir)
-
-                # Try glob match
-                if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(
-                    rel_path, pattern
-                ):
-                    matches.append(rel_path)
-                # Try substring match
-                elif pattern.lower() in name.lower():
-                    matches.append(rel_path)
-
-                if len(matches) >= MAX_RESULTS * 5:
+    async def run(self, input: dict[str, Any], event_stream: ToolCallEventStream) -> str:
+        pat = input.get("pattern", "")
+        SKIP = {".git","node_modules","__pycache__","target"}
+        matches = []
+        for dp, dns, fns in os.walk(self._wd):
+            dns[:] = [d for d in dns if d not in SKIP and not d.startswith(".")]
+            for n in fns + dns:
+                rp = os.path.relpath(os.path.join(dp, n), self._wd)
+                if fnmatch.fnmatch(n, pat) or fnmatch.fnmatch(rp, pat) or pat.lower() in n.lower():
+                    matches.append(rp)
+                if len(matches) >= 100:
                     break
-
-        # Sort by relevance (shorter paths first, exact matches first)
-        matches.sort(
-            key=lambda p: (
-                0 if os.path.basename(p).lower() == pattern.lower() else 1,
-                len(p),
-            )
-        )
-        matches = matches[:MAX_RESULTS]
-
+        matches.sort(key=lambda p: (0 if os.path.basename(p).lower()==pat.lower() else 1, len(p)))
+        matches = matches[:20]
         if not matches:
-            return f"No files found matching `{pattern}`"
-
-        result = f"Found {len(matches)} matches:\n"
-        for m in matches:
-            is_dir = os.path.isdir(os.path.join(self._working_dir, m))
-            suffix = "/" if is_dir else ""
-            result += f"  {m}{suffix}\n"
-
-        return result
+            return f"No files found matching `{pat}`"
+        return "Found:\n" + "\n".join(f"  {m}" for m in matches)

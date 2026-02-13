@@ -4,19 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zed-agent"
-version = "0.1.0"
-description = "A pluggable AI coding agent backend extracted from Zed's architecture"
+version = "0.2.0"
+description = "Faithful Python port of Zed's AI coding agent backend"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 dependencies = []
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.39.0"]
 openai = ["openai>=1.50.0"]
-litellm = ["litellm>=1.50.0"]
-all = ["anthropic>=0.39.0", "openai>=1.50.0", "litellm>=1.50.0"]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.23.0"]
+all = ["anthropic>=0.39.0", "openai>=1.50.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24.0"]
 
 [tool.setuptools.packages.find]
 include = ["zed_agent*"]
