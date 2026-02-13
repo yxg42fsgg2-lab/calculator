@@ -91,6 +91,37 @@ MAX_RETRY_ATTEMPTS = 4
 BASE_RETRY_DELAY = 5.0  # seconds
 
 
+# ── CompletionIntent — mirrors cloud_llm_client::CompletionIntent ──
+
+class CompletionIntent(str, Enum):
+    """Tracks whether a request is the initial user prompt or a follow-up
+    after tool results. This is passed through to the provider for billing
+    and prioritization. Mirrors cloud_llm_client::CompletionIntent."""
+    UserPrompt = "user_prompt"
+    ToolResults = "tool_results"
+    ThreadSummarization = "thread_summarization"
+
+
+# ── RateLimiter — mirrors crates/language_model/src/rate_limiter.rs ──
+
+class RateLimiter:
+    """Semaphore-based rate limiter. Mirrors Zed's RateLimiter.
+
+    Limits concurrent model requests. Critical for subagent support:
+    the stream must be dropped (permit released) before tool execution,
+    or subagents that need their own completion requests will deadlock.
+    """
+
+    def __init__(self, limit: int = 4):
+        self._semaphore = asyncio.Semaphore(limit)
+
+    async def acquire(self) -> None:
+        await self._semaphore.acquire()
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+
 # ╔══════════════════════════════════════════════════════════╗
 # ║  1. Message types — mirrors thread.rs lines 109-553     ║
 # ╚══════════════════════════════════════════════════════════╝
@@ -645,6 +676,70 @@ class AnyAgentTool:
 # ║  7. Retry logic — mirrors thread.rs retry_strategy_for   ║
 # ╚══════════════════════════════════════════════════════════╝
 
+# ╔══════════════════════════════════════════════════════════╗
+# ║  Subagent system — mirrors thread.rs + agent.rs          ║
+# ╚══════════════════════════════════════════════════════════╝
+
+@dataclass
+class SubagentContext:
+    """Mirrors thread.rs SubagentContext — tracks parent/depth for subagent threads."""
+    parent_thread_id: str
+    depth: int
+
+
+class SubagentHandle(abc.ABC):
+    """Mirrors thread.rs trait SubagentHandle."""
+
+    @abc.abstractmethod
+    def id(self) -> str:
+        ...
+
+    @abc.abstractmethod
+    async def wait_for_summary(self, summary_prompt: str) -> str:
+        """Wait for the subagent to complete, then ask it to summarize."""
+        ...
+
+
+class ThreadEnvironment(abc.ABC):
+    """Mirrors thread.rs trait ThreadEnvironment.
+
+    This is the bridge between the Thread and the external world.
+    In Zed, it's implemented by NativeThreadEnvironment which connects
+    to terminals and spawns subagent threads through the Agent.
+    """
+
+    @abc.abstractmethod
+    async def create_terminal(
+        self,
+        command: str,
+        cwd: Optional[str] = None,
+        output_byte_limit: Optional[int] = None,
+    ) -> str:
+        """Create and run a terminal command. Returns output."""
+        ...
+
+    @abc.abstractmethod
+    def create_subagent(
+        self,
+        parent_thread: "Thread",
+        label: str,
+        initial_prompt: str,
+        timeout_ms: Optional[int] = None,
+        allowed_tools: Optional[list[str]] = None,
+    ) -> SubagentHandle:
+        """Spawn a subagent thread. Mirrors ThreadEnvironment::create_subagent().
+
+        The subagent gets its own Thread with the same model and a subset of tools.
+        It runs the initial_prompt, and the caller awaits its summary.
+
+        Enforces:
+        - MAX_SUBAGENT_DEPTH (4 levels)
+        - MAX_PARALLEL_SUBAGENTS (8 concurrent)
+        - allowed_tools must be subset of parent's tools
+        """
+        ...
+
+
 class RetryStrategy:
     pass
 
@@ -739,14 +834,17 @@ class Thread:
         model: Optional[LanguageModel] = None,
         system_prompt: str = "",
         working_directory: str = ".",
+        environment: Optional[ThreadEnvironment] = None,
     ):
         self.id = str(uuid.uuid4())
         self.prompt_id = str(uuid.uuid4())
         self.title: Optional[str] = None
         self.messages: list[Message] = []
         self.model = model
+        self.summarization_model: Optional[LanguageModel] = None
         self.system_prompt = system_prompt
         self.working_directory = working_directory
+        self.environment = environment
 
         # Mirrors thread.rs fields
         self.running_turn: Optional[RunningTurn] = None
@@ -759,6 +857,16 @@ class Thread:
         self.thinking_effort: Optional[str] = None
         self.file_read_times: dict[str, float] = {}
 
+        # Subagent tracking — mirrors thread.rs subagent fields
+        self.subagent_context: Optional[SubagentContext] = None
+        self.running_subagents: list["Thread"] = []  # WeakEntity<Thread> in Rust
+
+        # Rate limiter — mirrors crates/language_model rate_limiter.rs
+        self.rate_limiter = RateLimiter(limit=4)
+
+        # Title generation
+        self._pending_title_generation: Optional[asyncio.Task] = None
+
     # ── Tool registration (mirrors add_tool / remove_tool) ──
 
     def add_tool(self, tool: AgentTool) -> None:
@@ -769,6 +877,44 @@ class Thread:
 
     def remove_tool(self, name: str) -> bool:
         return self.tools.pop(name, None) is not None
+
+    # ── Subagent support ──────────────────────────────────────
+
+    def depth(self) -> int:
+        """Current subagent depth. 0 = root agent."""
+        return self.subagent_context.depth if self.subagent_context else 0
+
+    def is_subagent(self) -> bool:
+        return self.subagent_context is not None
+
+    def parent_thread_id(self) -> Optional[str]:
+        return self.subagent_context.parent_thread_id if self.subagent_context else None
+
+    def register_running_subagent(self, subagent: "Thread") -> None:
+        self.running_subagents.append(subagent)
+
+    def unregister_running_subagent(self, session_id: str) -> None:
+        self.running_subagents = [s for s in self.running_subagents if s.id != session_id]
+
+    def running_subagent_count(self) -> int:
+        return len(self.running_subagents)
+
+    @staticmethod
+    def new_subagent(parent: "Thread") -> "Thread":
+        """Create a subagent Thread. Mirrors Thread::new_subagent()."""
+        child = Thread(
+            model=parent.model,
+            system_prompt=parent.system_prompt,
+            working_directory=parent.working_directory,
+            environment=parent.environment,
+        )
+        child.subagent_context = SubagentContext(
+            parent_thread_id=parent.id,
+            depth=parent.depth() + 1,
+        )
+        child.thinking_enabled = parent.thinking_enabled
+        child.thinking_effort = parent.thinking_effort
+        return child
 
     # ── Model management ────────────────────────────────────
 
@@ -804,7 +950,15 @@ class Thread:
     # ── Cancel ──────────────────────────────────────────────
 
     def cancel(self) -> Optional[asyncio.Task]:
-        """Cancel the running turn. Mirrors Thread::cancel()."""
+        """Cancel the running turn. Mirrors Thread::cancel().
+
+        Also cancels all running subagents (mirrors thread.rs L1404-1407).
+        """
+        # Cancel subagents first
+        for subagent in self.running_subagents:
+            subagent.cancel()
+        self.running_subagents.clear()
+
         if self.running_turn is None:
             self._flush_pending_message()
             return None
@@ -868,37 +1022,50 @@ class Thread:
     ) -> None:
         """The core agentic loop. Faithful port of Thread::run_turn_internal().
 
-        Loop:
-          1. Build completion request (system prompt + messages + tools)
-          2. Stream completion from model
-          3. Handle events: text→pending_message, tool_use→spawn tool task
-          4. Wait for ALL tool tasks to complete (parallel, like FuturesUnordered)
-          5. Flush pending message
-          6. If error → retry with strategy
-          7. If no tool results (end_turn) → break
-          8. If tool results → continue loop (model processes results)
+        Key fidelity points vs Zed (thread.rs L1702-1865):
+        1. CompletionIntent tracks UserPrompt vs ToolResults
+        2. Rate limiter acquired before streaming, released before tool exec
+        3. Batch event processing: collect all immediately available events
+        4. Cancellation raced against event consumption
+        5. Parallel tool execution via asyncio.gather (FuturesUnordered)
+        6. Title generation triggered after first flush
         """
         assert self.model is not None
         model = self.model
         attempt = 0
+        intent = CompletionIntent.UserPrompt
+        message_ix = len(self.messages) - 1  # for truncation on refusal
 
         try:
             while True:
                 # 1. Build request
-                request = self._build_completion_request(tools)
+                request = self._build_completion_request(tools, intent)
 
-                logger.debug("Calling model.stream_completion, attempt %d", attempt)
+                logger.debug("Calling model.stream_completion, attempt %d, intent %s", attempt, intent.value)
 
-                # 2. Stream completion
+                # 2. Acquire rate limit permit
+                await self.rate_limiter.acquire()
+
+                # 3. Stream completion with batch processing + cancellation race
                 tool_result_tasks: list[asyncio.Task[LanguageModelToolResult]] = []
                 error: Optional[Exception] = None
+                cancelled = False
+                stream_ref = None  # hold reference so we can explicitly release
 
                 try:
                     stream = model.stream_completion(request)
+                    stream_ref = stream  # keep alive
+
+                    # Inner loop: consume events, race with cancellation
+                    # Mirrors thread.rs L1732-1793 (batch processing pattern)
                     async for completion_event in stream:
+                        # Check cancellation (mirrors futures::select! on cancellation_rx)
                         if cancellation.borrow():
+                            cancelled = True
                             break
 
+                        # Process this event (in Zed, events are batched via now_or_never;
+                        # Python's async for already yields as fast as available)
                         try:
                             maybe_task = self._handle_completion_event(
                                 completion_event, event_stream, cancellation, tools,
@@ -908,16 +1075,26 @@ class Thread:
                         except CompletionError as e:
                             error = e
                             break
+
                 except LanguageModelCompletionError as e:
                     error = e
                 except Exception as e:
                     error = e
+                finally:
+                    # CRITICAL: Drop the stream to release the rate limit permit
+                    # BEFORE tool execution. Mirrors thread.rs L1795-1800:
+                    # "Drop the stream to release the rate limit permit before
+                    # tool execution. Without this, the permit would be held during
+                    # potentially long-running tool execution, which could cause
+                    # deadlocks when tools spawn subagents that need their own permits."
+                    stream_ref = None
+                    self.rate_limiter.release()
 
-                if cancellation.borrow():
+                if cancelled:
                     logger.debug("Turn cancelled by user, exiting")
                     return
 
-                # 4. Wait for ALL tool tasks (parallel — like FuturesUnordered)
+                # 4. Wait for ALL tool tasks in parallel (like FuturesUnordered)
                 end_turn = len(tool_result_tasks) == 0
                 if tool_result_tasks:
                     results = await asyncio.gather(
@@ -947,10 +1124,17 @@ class Thread:
                 # 5. Flush pending message
                 self._flush_pending_message()
 
+                # Trigger title generation after first successful flush
+                # (mirrors thread.rs L1826-1828)
+                if self.title is None and self._pending_title_generation is None:
+                    self._generate_title()
+
                 # 6. Handle errors with retry
                 if error is not None:
                     if isinstance(error, RefusalError):
                         event_stream.send_stop("refusal")
+                        # Truncate messages back to before the user message
+                        self.messages = self.messages[:message_ix]
                         return
                     if isinstance(error, MaxTokensError):
                         event_stream.send_stop("max_tokens")
@@ -962,11 +1146,7 @@ class Thread:
                         event_stream.send_error(error)
                         return
 
-                    max_a = (
-                        strategy.max_attempts
-                        if isinstance(strategy, FixedDelay)
-                        else strategy.max_attempts
-                    )
+                    max_a = strategy.max_attempts
                     if attempt > max_a:
                         event_stream.send_error(error)
                         return
@@ -980,11 +1160,12 @@ class Thread:
                     event_stream.send_retry(str(error), attempt, max_a, delay)
                     await asyncio.sleep(delay)
 
-                    # If the last message is an agent message with no tool results,
-                    # add a Resume to re-prompt
+                    # If last message is agent with no tool results, add Resume
+                    # and reset intent to UserPrompt (mirrors thread.rs L1846-1852)
                     if self.messages and self.messages[-1].kind == MessageKind.Agent:
                         am = self.messages[-1].agent_message
                         if am and not am.tool_results:
+                            intent = CompletionIntent.UserPrompt
                             self.messages.append(Message.resume())
                     continue
 
@@ -995,11 +1176,13 @@ class Thread:
 
                 # 8. Check for queued message (Zed's has_queued_message)
                 if self.has_queued_message:
-                    logger.debug("Queued message found, ending turn")
+                    logger.debug("Queued message found, ending turn at message boundary")
                     event_stream.send_stop("end_turn")
                     return
 
-                # Reset attempt counter after successful tool execution
+                # 9. Continue loop — switch intent to ToolResults, reset attempts
+                # (mirrors thread.rs L1861-1862)
+                intent = CompletionIntent.ToolResults
                 attempt = 0
 
         except Exception as e:
@@ -1194,9 +1377,12 @@ class Thread:
     def _build_completion_request(
         self,
         tools: dict[str, AnyAgentTool],
+        intent: CompletionIntent = CompletionIntent.UserPrompt,
     ) -> LanguageModelRequest:
-        """Mirrors Thread::build_completion_request()."""
-        # System prompt message
+        """Mirrors Thread::build_completion_request().
+
+        Note: intent is passed through to the provider (for billing/priority).
+        """
         lm_tools = [
             LanguageModelRequestTool(
                 name=name,
@@ -1216,7 +1402,7 @@ class Thread:
         for message in self.messages:
             messages.extend(message.to_request())
 
-        # Mark last message for caching
+        # Mark last message for caching (mirrors thread.rs L2585-2587)
         if messages:
             messages[-1].cache = True
 
@@ -1249,6 +1435,46 @@ class Thread:
         return None
 
     # ── Helpers ─────────────────────────────────────────────
+
+    # ── Title generation (mirrors Thread::generate_title) ──
+
+    def _generate_title(self) -> None:
+        """Generate thread title via summarization model. Mirrors Thread::generate_title()."""
+        model = self.summarization_model or self.model
+        if model is None:
+            return
+
+        messages_snapshot = list(self.messages)
+
+        async def _do_generate() -> None:
+            try:
+                prompt = "Generate a short (3-8 word) title for this conversation. Reply with ONLY the title, nothing else."
+                req_messages: list[LanguageModelRequestMessage] = []
+                for msg in messages_snapshot:
+                    req_messages.extend(msg.to_request())
+                req_messages.append(LanguageModelRequestMessage(
+                    role=Role.User,
+                    content=[TextContent(text=prompt)],
+                ))
+                request = LanguageModelRequest(messages=req_messages)
+
+                title = ""
+                async for event in model.stream_completion(request):
+                    if isinstance(event, LMTextEvent):
+                        lines = event.text.split("\n")
+                        title += lines[0]
+                        if len(lines) > 1:
+                            break  # Stop at first newline
+
+                if title:
+                    self.title = title.strip()
+                    logger.debug("Generated title: %s", self.title)
+            except Exception as e:
+                logger.debug("Title generation failed: %s", e)
+            finally:
+                self._pending_title_generation = None
+
+        self._pending_title_generation = asyncio.create_task(_do_generate())
 
     def _advance_prompt_id(self) -> None:
         self.prompt_id = str(uuid.uuid4())

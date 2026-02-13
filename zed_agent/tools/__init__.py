@@ -18,6 +18,7 @@ from zed_agent.tools.move_path import MovePathTool
 from zed_agent.tools.create_directory import CreateDirectoryTool
 from zed_agent.tools.now import NowTool
 from zed_agent.tools.fetch import FetchTool
+from zed_agent.tools.subagent import SubagentTool
 from zed_agent.thread import AgentTool
 
 ALL_TOOL_CLASSES = [
@@ -34,13 +35,20 @@ ALL_TOOL_CLASSES = [
     CreateDirectoryTool,
     NowTool,
     FetchTool,
+    # SubagentTool requires environment, registered separately
 ]
 
 ALL_TOOL_NAMES = [cls.NAME for cls in ALL_TOOL_CLASSES]  # type: ignore[attr-defined]
+ALL_TOOL_NAMES.append(SubagentTool.NAME)
 
 
 def create_default_tools(working_directory: str) -> list[AgentTool]:
-    """Mirrors Thread::add_default_tools(). Returns instances of all built-in tools."""
+    """Mirrors Thread::add_default_tools(). Returns instances of all built-in tools.
+
+    Note: SubagentTool requires a ThreadEnvironment and parent_thread reference,
+    so it must be registered separately by the Agent after thread creation.
+    Mirrors how Zed conditionally adds SubagentTool based on feature flag and depth.
+    """
     return [
         ReadFileTool(working_directory),
         EditFileTool(working_directory),

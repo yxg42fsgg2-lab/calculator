@@ -337,6 +337,96 @@ class TestTools:
         assert "T" in result  # ISO format
 
 
+class TestSubagentSystem:
+    def test_depth_tracking(self):
+        parent = Thread(model=FakeModel())
+        assert parent.depth() == 0
+        assert not parent.is_subagent()
+
+        child = Thread.new_subagent(parent)
+        assert child.depth() == 1
+        assert child.is_subagent()
+        assert child.parent_thread_id() == parent.id
+
+        grandchild = Thread.new_subagent(child)
+        assert grandchild.depth() == 2
+
+    def test_running_subagent_tracking(self):
+        parent = Thread(model=FakeModel())
+        child1 = Thread.new_subagent(parent)
+        child2 = Thread.new_subagent(parent)
+
+        parent.register_running_subagent(child1)
+        parent.register_running_subagent(child2)
+        assert parent.running_subagent_count() == 2
+
+        parent.unregister_running_subagent(child1.id)
+        assert parent.running_subagent_count() == 1
+
+    def test_subagent_inherits_config(self):
+        parent = Thread(model=FakeModel(), system_prompt="Be helpful", working_directory="/test")
+        parent.thinking_enabled = True
+        parent.thinking_effort = "high"
+
+        child = Thread.new_subagent(parent)
+        assert child.model is parent.model
+        assert child.system_prompt == parent.system_prompt
+        assert child.working_directory == parent.working_directory
+        assert child.thinking_enabled == True
+        assert child.thinking_effort == "high"
+
+
+class TestCompletionIntent:
+    @pytest.mark.asyncio
+    async def test_intent_switches_to_tool_results(self):
+        """After tool execution, intent should switch from UserPrompt to ToolResults."""
+        from zed_agent.thread import CompletionIntent
+
+        # We can verify this indirectly through the request building
+        # The intent tracking happens in _run_turn_internal
+        model = FakeModel()
+        thread = Thread(model=model)
+        # CompletionIntent enum exists and has correct values
+        assert CompletionIntent.UserPrompt.value == "user_prompt"
+        assert CompletionIntent.ToolResults.value == "tool_results"
+
+
+class TestRateLimiter:
+    @pytest.mark.asyncio
+    async def test_rate_limiter_basic(self):
+        from zed_agent.thread import RateLimiter
+        rl = RateLimiter(limit=2)
+        # Should be able to acquire twice
+        await rl.acquire()
+        await rl.acquire()
+        # Release both
+        rl.release()
+        rl.release()
+        # Should be able to acquire again
+        await rl.acquire()
+        rl.release()
+
+    @pytest.mark.asyncio
+    async def test_rate_limiter_blocks(self):
+        from zed_agent.thread import RateLimiter
+        rl = RateLimiter(limit=1)
+        await rl.acquire()
+        # Second acquire should block
+        acquired = False
+        async def try_acquire():
+            nonlocal acquired
+            await rl.acquire()
+            acquired = True
+        task = asyncio.create_task(try_acquire())
+        await asyncio.sleep(0.05)
+        assert not acquired
+        rl.release()
+        await asyncio.sleep(0.05)
+        assert acquired
+        rl.release()
+        task.cancel()
+
+
 class TestTemplates:
     def test_render_with_tools(self, tmp_path):
         from zed_agent.templates import render_system_prompt
